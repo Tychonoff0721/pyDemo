@@ -4,8 +4,20 @@ from modelscope import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model, TaskType
 import os
+import torch
 
-# 加载数据（与您的代码相同）
+# 检查是否有可用的AMD GPU
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"使用GPU: {torch.cuda.get_device_name(0)}")
+    # 检查是否为ROCm（AMD GPU）
+    if "AMD" in torch.cuda.get_device_name(0) or "Radeon" in torch.cuda.get_device_name(0):
+        print("检测到AMD GPU，使用ROCm后端")
+else:
+    device = torch.device("cpu")
+    print("未检测到GPU，使用CPU训练")
+
+# 加载数据
 ds = load_dataset(
     "json",
     data_files={"train": "train.json"},
@@ -43,11 +55,15 @@ chat_input = tokenizer.apply_chat_template(
 
 train_ds = Dataset.from_dict({"text": chat_input})
 
+# 直接指定设备而不是使用device_map="auto"
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    dtype="auto",
-    device_map="auto"
+    torch_dtype=torch.float16,  # 明确使用float16
+    device_map=None  # 不使用自动设备映射
 )
+
+# 将模型移动到GPU
+model = model.to(device)
 
 # 配置LoRA
 lora_config = LoraConfig(
@@ -87,8 +103,8 @@ def improved_collator(features):
 # 训练参数
 training_args = SFTConfig(
     dataset_text_field="text",
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=2,  # 减小批次大小以适应GPU内存
+    gradient_accumulation_steps=8,  # 增加梯度累积步数以保持有效批次大小
     max_steps=800,
     learning_rate=5e-5,
     warmup_steps=50,
@@ -98,11 +114,13 @@ training_args = SFTConfig(
     lr_scheduler_type="cosine",
     seed=42,
     report_to="none",
-    fp16=True,
+    fp16=True,  # 使用fp16混合精度训练
     bf16=False,
     output_dir="./lora_checkpoints",
     save_steps=100,
     save_total_limit=3,
+    dataloader_pin_memory=False,  # 对于AMD GPU可能需要禁用
+    ddp_find_unused_parameters=False,  # 分布式训练优化
 )
 
 trainer = SFTTrainer(
